@@ -1,0 +1,19 @@
+# Build output
+Debug/
+Release/
+*.o
+*.d
+*.elf
+*.hex
+*.bin
+*.map
+*.list
+*.lst
+*.su
+
+# Launch files (CubeIDE recreates these)
+*.launch
+
+# OS junk
+.DS_Store
+Thumbs.db

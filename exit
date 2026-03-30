@@ -1,0 +1,379 @@
+[33mcommit 2112d69b40e60ba51c0753c22903ccac6787bba2[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mZero[m[33m, [m[1;33mtag: [m[1;33mv16.0[m[33m)[m
+Author: CCID <rahul.mandal@pmlindia.com>
+Date:   Mon Mar 30 10:56:33 2026 +0530
+
+    16.0_DC_active
+
+[1mdiff --git a/Code_variants/v16_0.c b/Code_variants/v16_0.c[m
+[1mnew file mode 100644[m
+[1mindex 0000000..385b405[m
+[1m--- /dev/null[m
+[1m+++ b/Code_variants/v16_0.c[m
+[36m@@ -0,0 +1,1034 @@[m
+[32m+[m[32m/* USER CODE BEGIN Header */[m
+[32m+[m[32m/*The version of the code is for testing purpose and seems to be valid[m
+[32m+[m[32mZero + 16.0[m[41m [m
+[32m+[m[32mDC Accuracy check[m
+[32m+[m[32mDC Trigger check[m
+[32m+[m[32mAC accuracy Not verified[m
+[32m+[m[32mAC trigger Not verified[m
+[32m+[m[32mMODbus Check[m
+[32m+[m[32mAC/DC Clasification check*/[m
+[32m+[m[32m/**[m
+[32m+[m[32m  ******************************************************************************[m
+[32m+[m[32m  * @file           : main.c[m
+[32m+[m[32m  * @brief          : CCID v15.1 — Modbus RTU + Fixed AC/DC Classifier + Dual-Stage Alert[m
+[32m+[m[32m  * @version        : 16.0[m
+[32m+[m[32m  ******************************************************************************[m
+[32m+[m[32m  *[m
+[32m+[m[32m  * CHANGES from v13.1.7:[m
+[32m+[m[32m  *[m
+[32m+[m[32m  * [1] MODBUS RTU over USART2 at 9600 baud (replacing TeraTerm debug UART)[m
+[32m+[m[32m  *     Register map (per MD0630T01A spec):[m
+[32m+[m[32m  *       0x0000  DC Current    R    0.01 mA/LSB[m
+[32m+[m[32m  *       0x0001  AC Current    R    0.01 mA/LSB[m
+[32m+[m[32m  *       0x0002  DC Threshold  R/W  0.1 mA/LSB  (default 60 = 6.0 mA)[m
+[32m+[m[32m  *       0x0003  AC Threshold  R/W  0.1 mA/LSB  (default 300 = 30.0 mA)[m
+[32m+[m[32m  *       0x0100  Slave Address R/W  (default 1)[m
+[32m+[m[32m  *     Function codes supported: 0x03 (Read), 0x10 (Write Multiple)[m
+[32m+[m[32m  *     Frame timeout: 5 ms inter-frame silence (T3.5 at 9600 baud)[m
+[32m+[m[32m  *     CRC: Modbus CRC-16[m
+[32m+[m[32m  *[m
+[32m+[m[32m  * [2] AC/DC CLASSIFIER FIX (resolves 2-6 mA DC misclassification as AC)[m
+[32m+[m[32m  *     Old bug: variation = (max-min)/|avg| > 0.50 wrongly reclassified[m
+[32m+[m[32m  *              small DC signals as AC because noise spread is fixed (~78 ns)[m
+[32m+[m[32m  *              while avg shrinks at low currents.[m
+[32m+[m[32m  *     Fix:     Inside has_positive&&has_negative branch, check avg deviation[m
+[32m+[m[32m  *              from offset_avg. If |avg - offset_avg| > offset_rms_ns,[m
+[32m+[m[32m  *              the mean shift is real → classify as DC.[m
+[32m+[m[32m  *              True AC has avg ≈ offset_avg (AC averages to zero).[m
+[32m+[m[32m  *[m
+[32m+[m[32m  * [3] AUTO-CALIBRATION on boot (1 sec settle + offset + gain = ~3 sec total)[m
+[32m+[m[32m  *     No manual commands needed. Modbus polling can start immediately after.[m
+[32m+[m[32m  *[m
+[32m+[m[32m  * [4] ALARM PINS[m
+[32m+[m[32m  *     PB4      = DC alarm  — HIGH when |DC| >= dc_alert_mA[m
+[32m+[m[32m  *     PB3      = AC alarm  — HIGH when AC  >= ac_alert_mA[m
+[32m+[m[32m  *     PB1      = AC+DC alarm — HIGH when either DC or AC alarm active[m
+[32m+[m[32m  *     PA12     = CAL pulse — used only during gain calibration[m
+[32m+[m[32m  */[m
+[32m+[m[32m/* USER CODE END Header */[m
+[32m+[m
+[32m+[m[32m#include "main.h"[m
+[32m+[m[32m#include <string.h>[m
+[32m+[m[32m#include <stdio.h>[m
+[32m+[m[32m#include <math.h>[m
+[32m+[m
+[32m+[m[32m/* ============================================================[m
+[32m+[m[32m *  Peripheral handles[m
+[32m+[m[32m * ============================================================ */[m
+[32m+[m[32mTIM_HandleTypeDef  htim1;[m
+[32m+[m[32mUART_HandleTypeDef huart2;[m
+[32m+[m
+[32m+[m[32m/* ============================================================[m
+[32m+[m[32m *  Firmware constants[m
+[32m+[m[32m * ============================================================ */[m
+[32m+[m[32m#define SAMPLE_COUNT          100[m
+[32m+[m[32m#define TICK_NS               15.625f[m
+[32m+[m[32m#define CAPTURE_WINDOW_MS     80[m
+[32m+[m[32m#define EARLY_START_MS        10          /* Start early check at 10 ms */[m
+[32m+[m[32m#define EARLY_MIN_SAMPLES     15          /* Need >= 15 samples          */[m
+[32m+[m[32m#define MAX_LIVE_SAMPLES      350[m
+[32m+[m
+[32m+[m[32m/* Alarm thresholds (mA) — used for pin control only */[m
+[32m+[m[32m#define DC_ALERT_MA           6.0f[m
+[32m+[m[32m#define AC_ALERT_MA           30.0f[m
+[32m+[m
+[32m+[m[32m/* Hysteresis: alarm clears when current drops to 90% of threshold.[m
+[32m+[m[32m *[m
+[32m+[m[32m * The early check (ISR) threshold is derived as: alarm_thresh / HYST_FACTOR[m
+[32m+[m[32m * = 111% of alarm threshold. This guarantees Stage 2 ALWAYS confirms when[m
+[32m+[m[32m * early fires — true at ANY threshold value set via Modbus registers:[m
+[32m+[m[32m *[m
+[32m+[m[32m *   threshold    early fires at    Stage 2 arms at    Stage 2 clears at[m
+[32m+[m[32m *    30 mA          33.3 mA           30.0 mA            27.0 mA   ← no overlap[m
+[32m+[m[32m *    40 mA          44.4 mA           40.0 mA            36.0 mA   ← no overlap[m
+[32m+[m[32m *   100 mA         111.1 mA          100.0 mA            90.0 mA   ← no overlap[m
+[32m+[m[32m *[m
+[32m+[m[32m * Jitter is impossible at any threshold: early only fires when Stage 2[m
+[32m+[m[32m * will also arm, so they never fight each other. */[m
+[32m+[m[32m#define ALARM_HYST_FACTOR     0.90f[m
+[32m+[m
+[32m+[m[32m/* Signal-loss watchdog: clear alarm after this many ms of no samples */[m
+[32m+[m[32m#define SIGNAL_LOSS_MS        2000UL[m
+[32m+[m
+[32m+[m[32m/* ============================================================[m
+[32m+[m[32m *  Modbus constants[m
+[32m+[m[32m * ============================================================ */[m
+[32m+[m[32m#define MB_FRAME_BUF          64[m
+[32m+[m[32m#define MB_INTER_FRAME_MS     5           /* T3.5 silence timeout         */[m
+[32m+[m[32m#define MB_FC_READ            0x03[m
+[32m+[m[32m#define MB_FC_WRITE_MULTI     0x10[m
+[32m+[m[32m#define MB_EX_ILLEGAL_FUNC    0x01[m
+[32m+[m[32m#define MB_EX_ILLEGAL_ADDR    0x02[m
+[32m+[m[32m#define MB_EX_ILLEGAL_DATA    0x03[m
+[32m+[m
+[32m+[m[32m/* Register addresses */[m
+[32m+[m[32m#define MB_REG_DC_CURRENT     0x0000      /* R   — 0.01 mA/LSB            */[m
+[32m+[m[32m#define MB_REG_AC_CURRENT     0x0001      /* R   — 0.01 mA/LSB            */[m
+[32m+[m[32m#define MB_REG_DC_THRESH      0x0002      /* R/W — 0.1 mA/LSB, def=60     */[m
+[32m+[m[32m#define MB_REG_AC_THRESH      0x0003      /* R/W — 0.1 mA/LSB, def=300    */[m
+[32m+[m[32m#define MB_REG_SLAVE_ADDR     0x0100      /* R/W — slave address, def=1   */[m
+[32m+[m
+[32m+[m[32m/* ============================================================[m
+[32m+[m[32m *  Input capture state machine[m
+[32m+[m[32m * ============================================================ */[m
+[32m+[m[32mvolatile uint16_t cap_a1 = 0, cap_b = 0, cap_a2 = 0;[m
+[32m+[m[32mvolatile uint8_t  cap_state = 0;[m
+[32m+[m
+[32m+[m[32m/* ============================================================[m
+[32m+[m[32m *  Calibration accumulators[m
+[32m+[m[32m * ============================================================ */[m
+[32m+[m[32mvolatile float    del_t_sum_ns    = 0.0f;[m
+[32m+[m[32mvolatile float    del_t_sum_sq_ns = 0.0f;[m
+[32m+[m[32mvolatile uint16_t sample_count    = 0;[m
+[32m+[m
+[32m+[m[32mvolatile float    offset_avg_ns   = 0.0f;[m
+[32m+[m[32mvolatile float    offset_rms_ns   = 0.0f;[m
+[32m+[m[32mvolatile float    mg_ns           = 0.0f;[m
+[32m+[m[32mvolatile float    Cg_ns           = 0.0f;[m
+[32m+[m[32mvolatile float    sensitivity_ns  = 0.0f;[m
+[32m+[m
+[32m+[m[32m/* ============================================================[m
+[32m+[m[32m *  Live capture window[m
+[32m+[m[32m * ============================================================ */[m
+[32m+[m[32mvolatile float    live_samples_ns[MAX_LIVE_SAMPLES];[m
+[32m+[m[32mvolatile uint16_t live_index       = 0;[m
+[32m+[m[32mvolatile uint8_t  live_capturing   = 0;[m
+[32m+[m[32mvolatile uint8_t  live_window_done = 0;[m
+[32m+[m[32mvolatile uint32_t live_start_tick  = 0;[m
+[32m+[m
+[32m+[m[32m/* ============================================================[m
+[32m+[m[32m *  Early alert — ISR-side running accumulators[m
+[32m+[m[32m * ============================================================ */[m
+[32m+[m[32mvolatile float    early_sum_sq_ns  = 0.0f;[m
+[32m+[m[32mvolatile float    early_sum_ns     = 0.0f;[m
+[32m+[m[32mvolatile uint16_t early_count      = 0;[m
+[32m+[m[32mvolatile uint8_t  early_alert_fired = 0;[m
+[32m+[m[32mvolatile uint32_t early_fire_tick  = 0;[m
+[32m+[m
+[32m+[m[32m/* Pre-computed for ISR variance classifier */[m
+[32m+[m[32mvolatile float    offset_rms_sq = 0.0f;[m
+[32m+[m
+[32m+[m[32m/* ============================================================[m
+[32m+[m[32m *  Alarm state (persists across windows)[m
+[32m+[m[32m * ============================================================ */[m
+[32m+[m[32mvolatile uint8_t  alarm_dc_active  = 0;[m
+[32m+[m[32mvolatile uint8_t  alarm_ac_active  = 0;[m
+[32m+[m[32mvolatile uint32_t last_sample_tick = 0;   /* for signal-loss watchdog */[m
+[32m+[m
+[32m+[m[32m/* ============================================================[m
+[32m+[m[32m *  Modbus registers (the "database")[m
+[32m+[m[32m * ============================================================ */[m
+[32m+[m[32mvolatile uint16_t mb_dc_current   = 0;     /* 0x0000 — written by process_capture_window */[m
+[32m+[m[32mvolatile uint16_t mb_ac_current   = 0;     /* 0x0001 — written by process_capture_window */[m
+[32m+[m[32mvolatile uint16_t mb_dc_thresh    = 60;    /* 0x0002 — 60 = 6.0 mA default              */[m
+[32m+[m[32mvolatile uint16_t mb_ac_thresh    = 300;   /* 0x0003 — 300 = 30.0 mA default            */[m
+[32m+[m[32mvolatile uint16_t mb_slave_addr   = 1;     /* 0x0100 — slave address                    */[m
+[32m+[m
+[32m+[m[32m/* Modbus frame buffers */[m
+[32m+[m[32mstatic uint8_t  mb_rx_buf[MB_FRAME_BUF];[m
+[32m+[m[32mstatic uint8_t  mb_tx_buf[MB_FRAME_BUF];[m
+[32m+[m[32mstatic uint8_t  mb_rx_idx      = 0;[m
+[32m+[m[32mstatic uint8_t  mb_rx_len      = 0;[m
+[32m+[m[32mstatic uint8_t  mb_frame_ready = 0;[m
+[32m+[m[32mstatic uint32_t mb_last_rx_tick = 0;[m
+[32m+[m
+[32m+[m[32m/* ============================================================[m
+[32m+[m[32m *  System state machine[m
+[32m+[m[32m * ============================================================ */[m
+[32m+[m[32mtypedef enum {[m
+[32m+[m[32m    STATE_IDLE,[m
+[32m+[m[32m    STATE_OFFSET_SAMPLING,[m
+[32m+[m[32m    STATE_OFFSET_DONE,[m
+[32m+[m[32m    STATE_MG_SAMPLING,[m
+[32m+[m[32m    STATE_MG_DONE,[m
+[32m+[m[32m    STATE_LIVE_CAPTURE[m
+[32m+[m[32m} SystemState;[m
+[32m+[m
+[32m+[m[32mvolatile SystemState sys_state  = STATE_IDLE;[m
+[32m+[m[32mvolatile uint8_t     data_ready = 0;[m
+[32m+[m[32mvolatile uint8_t     cal_status = 0;   /* 1 = calibration complete */[m
+[32m+[m
+[32m+[m[32m/* ============================================================[m
+[32m+[m[32m *  Function prototypes[m
+[32m+[m[32m * ============================================================ */[m
+[32m+[m[32mvoid SystemClock_Config(void);[m
+[32m+[m[32mstatic void MX_GPIO_Init(void);[m
+[32m+[m[32mstatic void MX_TIM1_Init(void);[m
+[32m+[m[32mstatic void MX_USART2_UART_Init(void);[m
+[32m+[m
+[32m+[m[32mstatic void auto_calibrate(void);[m
+[32m+[m[32mstatic void start_capture_window(void);[m
+[32m+[m[32mstatic void compute_early_thresholds(void);[m
+[32m+[m[32mstatic void process_capture_window(void);[m
+[32m+[m[32mstatic void sync_alarm_pins(void);[m
+[32m+[m
+[32m+[m[32m/* Modbus helpers */[m
+[32m+[m[32mstatic uint16_t modbus_crc16(const uint8_t *buf, uint16_t len);[m
+[32m+[m[32mstatic uint16_t modbus_read_register(uint16_t addr);[m
+[32m+[m[32mstatic uint8_t  modbus_write_register(uint16_t addr, uint16_t value);[m
+[32m+[m[32mstatic void     modbus_poll_rx(void);[m
+[32m+[m[32mstatic void     modbus_process_frame(void);[m
+[32m+[m[32mstatic void     modbus_send(const uint8_t *buf, uint8_t len);[m
+[32m+[m
+[32m+[m[32m/* ============================================================[m
+[32m+[m[32m *  CRC-16 (Modbus polynomial 0xA001)[m
+[32m+[m[32m * ============================================================ */[m
+[32m+[m[32mstatic uint16_t modbus_crc16(const uint8_t *buf, uint16_t len)[m
+[32m+[m[32m{[m
+[32m+[m[32m    uint16_t crc = 0xFFFF;[m
+[32m+[m[32m    for (uint16_t i = 0; i < len; i++)[m
+[32m+[m[32m    {[m
+[32m+[m[32m        crc ^= buf[i];[m
+[32m+[m[32m        for (uint8_t b = 0; b < 8; b++)[m
+[32m+[m[32m        {[m
+[32m+[m[32m            if (crc & 0x0001)[m
+[32m+[m[32m                crc = (crc >> 1) ^ 0xA001;[m
+[32m+[m[32m            else[m
+[32m+[m[32m                crc >>= 1;[m
+[32m+[m[32m        }[m
+[32m+[m[32m    }[m
+[32m+[m[32m    return crc;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m/* ============================================================[m
+[32m+[m[32m *  Modbus register read  (returns 0xFFFF for invalid addr)[m
+[32m+[m[32m * ============================================================ */[m
+[32m+[m[32mstatic uint16_t modbus_read_register(uint16_t addr)[m
+[32m+[m[32m{[m
+[32m+[m[32m    switch (addr)[m
+[32m+[m[32m    {[m
+[32m+[m[32m        case MB_REG_DC_CURRENT:  return mb_dc_current;[m
+[32m+[m[32m        case MB_REG_AC_CURRENT:  return mb_ac_current;[m
+[32m+[m[32m        case MB_REG_DC_THRESH:   return mb_dc_thresh;[m
+[32m+[m[32m        case MB_REG_AC_THRESH:   return mb_ac_thresh;[m
+[32m+[m[32m        case MB_REG_SLAVE_ADDR:  return mb_slave_addr;[m
+[32m+[m[32m        default:                 return 0xFFFF;[m
+[32m+[m[32m    }[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m/* ============================================================[m
+[32m+[m[32m *  Modbus register write  (returns 0=OK, 1=illegal addr/data)[m
+[32m+[m[32m * ============================================================ */[m
+[32m+[m[32mstatic uint8_t modbus_write_register(uint16_t addr, uint16_t value)[m
+[32m+[m[32m{[m
+[32m+[m[32m    switch (addr)[m
+[32m+[m[32m    {[m
+[32m+[m[32m        case MB_REG_DC_THRESH:[m
+[32m+[m[32m            /* Accept any non-zero value (0 would disable alarm) */[m
+[32m+[m[32m            if (value == 0) return 1;[m
+[32m+[m[32m            mb_dc_thresh = value;[m
+[32m+[m[32m            return 0;[m
+[32m+[m
+[32m+[m[32m        case MB_REG_AC_THRESH:[m
+[32m+[m[32m            if (value == 0) return 1;[m
+[32m+[m[32m            mb_ac_thresh = value;[m
+[32m+[m[32m            return 0;[m
+[32m+[m
+[32m+[m[32m        case MB_REG_SLAVE_ADDR:[m
+[32m+[m[32m            /* Valid slave addresses: 1–247 */[m
+[32m+[m[32m            if (value < 1 || value > 247) return 1;[m
+[32m+[m[32m            mb_slave_addr = value;[m
+[32m+[m[32m            return 0;[m
+[32m+[m
+[32m+[m[32m        /* Current registers are read-only */[m
+[32m+[m[32m        case MB_REG_DC_CURRENT:[m
+[32m+[m[32m        case MB_REG_AC_CURRENT:[m
+[32m+[m[32m        default:[m
+[32m+[m[32m            return 1;[m
+[32m+[m[32m    }[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m/* ============================================================[m
+[32m+[m[32m *  Transmit a Modbus response frame[m
+[32m+[m[32m * ============================================================ */[m
+[32m+[m[32mstatic void modbus_send(const uint8_t *buf, uint8_t len)[m
+[32m+[m[32m{[m
+[32m+[m[32m    for (uint8_t i = 0; i < len; i++)[m
+[32m+[m[32m    {[m
+[32m+[m[32m        while (!(USART2->ISR & USART_ISR_TXE)) {}[m
+[32m+[m[32m        USART2->TDR = buf[i];[m
+[32m+[m[32m    }[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m/* ============================================================[m
+[32m+[m[32m *  Poll USART2 RX for incoming Modbus bytes.[m
+[32m+[m[32m *  Call every main-loop iteration (~10 µs).[m
+[32m+[m[32m *  Sets mb_frame_ready after MB_INTER_FRAME_MS silence.[m
+[32m+[m[32m * ============================================================ */[m
+[32m+[m[32mstatic void modbus_poll_rx(void)[m
+[32m+[m[32m{[m
+[32m+[m[32m    /* Accumulate incoming bytes */[m
+[32m+[m[32m    while (USART2->ISR & USART_ISR_RXNE)[m
+[32m+[m[32m    {[m
+[32m+[m[32m        uint8_t ch = (uint8_t)(USART2->RDR & 0xFF);[m
+[32m+[m[32m        if (mb_rx_idx < MB_FRAME_BUF)[m
+[32m+[m[32m            mb_rx_buf[mb_rx_idx++] = ch;[m
+[32m+[m[32m        mb_last_rx_tick = HAL_GetTick();[m
+[32m+[m[32m        mb_frame_ready  = 0;   /* reset — still receiving */[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    /* Detect end-of-frame: 5 ms silence after last byte */[m
+[32m+[m[32m    if (mb_rx_idx > 0 && !mb_frame_ready)[m
+[32m+[m[32m    {[m
+[32m+[m[32m        if ((HAL_GetTick() - mb_last_rx_tick) >= MB_INTER_FRAME_MS)[m
+[32m+[m[32m        {[m
+[32m+[m[32m            mb_rx_len      = mb_rx_idx;[m
+[32m+[m[32m            mb_rx_idx      = 0;[m
+[32m+[m[32m            mb_frame_ready = 1;[m
+[32m+[m[32m        }[m
+[32m+[m[32m    }[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m/* ============================================================[m
+[32m+[m[32m *  Process a complete Modbus frame.[m
+[32m+[m[32m *  Supports FC 0x03 (Read Holding Registers)[m
+[32m+[m[32m *  and      FC 0x10 (Write Multiple Registers).[m
+[32m+[m[32m *  Responds to broadcast address 0x00 (no reply sent).[m
+[32m+[m[32m * ============================================================ */[m
+[32m+[m[32mstatic void modbus_process_frame(void)[m
+[32m+[m[32m{[m
+[32m+[m[32m    if (!mb_frame_ready) return;[m
+[32m+[m[32m    mb_frame_ready = 0;[m
+[32m+[m
+[32m+[m[32m    /* Minimum frame length: 4 bytes (addr + func + 2 CRC) */[m
+[32m+[m[32m    if (mb_rx_len < 4) return;[m
+[32m+[m
+[32m+[m[32m    uint8_t rx_addr = mb_rx_buf[0];[m
+[32m+[m
+[32m+[m[32m    /* Accept our address or broadcast 0x00 */[m
+[32m+[m[32m    if (rx_addr != (uint8_t)mb_slave_addr && rx_addr != 0x00) return;[m
+[32m+[m
+[32m+[m[32m    /* Validate CRC */[m
+[32m+[m[32m    uint16_t rx_crc   = ((uint16_t)mb_rx_buf[mb_rx_len - 1] << 8) |[m
+[32m+[m[32m                         (uint16_t)mb_rx_buf[mb_rx_len - 2];[m
+[32m+[m[32m    uint16_t calc_crc = modbus_crc16(mb_rx_buf, mb_rx_len - 2);[m
+[32m+[m[32m    if (rx_crc != calc_crc) return;[m
+[32m+[m
+[32m+[m[32m    uint8_t func = mb_rx_buf[1];[m
+[32m+[m
+[32m+[m[32m    /* ---- FC 0x03: Read Holding Registers ---- */[m
+[32m+[m[32m    if (func == MB_FC_READ)[m
+[32m+[m[32m    {[m
+[32m+[m[32m        /* Request: [addr][0x03][reg_hi][reg_lo][qty_hi][qty_lo][CRC_lo][CRC_hi] */[m
+[32m+[m[32m        if (mb_rx_len < 8) return;[m
+[32m+[m
+[32m+[m[32m        uint16_t start_reg = ((uint16_t)mb_rx_buf[2] << 8) | mb_rx_buf[3];[m
+[32m+[m[32m        uint16_t num_regs  = ((uint16_t)mb_rx_buf[4] << 8) | mb_rx_buf[5];[m
+[32m+[m
+[32m+[m[32m        if (num_regs < 1 || num_regs > 10) /* sanity limit */[m
+[32m+[m[32m        {[m
+[32m+[m[32m            /* Exception: illegal data value */[m
+[32m+[m[32m            if (rx_addr == 0x00) return;[m
+[32m+[m[32m            mb_tx_buf[0] = (uint8_t)mb_slave_addr;[m
+[32m+[m[32m            mb_tx_buf[1] = 0x83;   /* 0x03 | 0x80 */[m
+[32m+[m[32m            mb_tx_buf[2] = MB_EX_ILLEGAL_DATA;[m
+[32m+[m[32m            uint16_t crc = modbus_crc16(mb_tx_buf, 3);[m
+[32m+[m[32m            mb_tx_buf[3] = (uint8_t)(crc & 0xFF);[m
+[32m+[m[32m            mb_tx_buf[4
