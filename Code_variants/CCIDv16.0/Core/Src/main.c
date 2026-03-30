@@ -2,172 +2,113 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : CCID v15.1 — Modbus RTU + Fixed AC/DC Classifier + Dual-Stage Alert
-  * @version        : 16.0
+  * @brief          : CCID v13.7 — Continuous Early Check + Signed DC + Quad AC
+  * @version        : 13.1.7 (the Most accurate post 6mA DC)
   ******************************************************************************
   *
-  * CHANGES from v13.1.7:
+  * Based on v13.6 (Signed DC + Quadratic AC + Dual-Stage).
   *
-  * [1] MODBUS RTU over USART2 at 9600 baud (replacing TeraTerm debug UART)
-  *     Register map (per MD0630T01A spec):
-  *       0x0000  DC Current    R    0.01 mA/LSB
-  *       0x0001  AC Current    R    0.01 mA/LSB
-  *       0x0002  DC Threshold  R/W  0.1 mA/LSB  (default 60 = 6.0 mA)
-  *       0x0003  AC Threshold  R/W  0.1 mA/LSB  (default 300 = 30.0 mA)
-  *       0x0100  Slave Address R/W  (default 1)
-  *     Function codes supported: 0x03 (Read), 0x10 (Write Multiple)
-  *     Frame timeout: 5 ms inter-frame silence (T3.5 at 9600 baud)
-  *     CRC: Modbus CRC-16
+  * KEY CHANGE in v13.1.7:
+  *   Stage 1 now checks EVERY SAMPLE from 20ms onward (not once at 40ms).
+  *   The moment the running accumulator crosses the threshold, PB1 fires.
+  *   Typical PB1 response: 20-40ms for strong signals.
   *
-  * [2] AC/DC CLASSIFIER FIX (resolves 2-6 mA DC misclassification as AC)
-  *     Old bug: variation = (max-min)/|avg| > 0.50 wrongly reclassified
-  *              small DC signals as AC because noise spread is fixed (~78 ns)
-  *              while avg shrinks at low currents.
-  *     Fix:     Inside has_positive&&has_negative branch, check avg deviation
-  *              from offset_avg. If |avg - offset_avg| > offset_rms_ns,
-  *              the mean shift is real → classify as DC.
-  *              True AC has avg ≈ offset_avg (AC averages to zero).
+  *   The check is extremely lightweight per sample:
+  *     AC: one divide + one subtract + one compare (all on squared values)
+  *     DC: one divide + one fabsf + one compare
+  *   No sqrt ever in ISR. Total ISR overhead: ~200ns per sample.
   *
-  * [3] AUTO-CALIBRATION on boot (1 sec settle + offset + gain = ~3 sec total)
-  *     No manual commands needed. Modbus polling can start immediately after.
+  *   Stage 2 (precision at ~82ms) is unchanged from v13.6:
+  *     DC: signed average, direction-aware
+  *     AC: RMS + cycle trimming + quadratic offset
+  *     PB1 corrected based on precise value.
   *
-  * [4] ALARM PINS
-  *     PB4      = DC alarm  — HIGH when |DC| >= dc_alert_mA
-  *     PB3      = AC alarm  — HIGH when AC  >= ac_alert_mA
-  *     PB1      = AC+DC alarm — HIGH when either DC or AC alarm active
-  *     PA12     = CAL pulse — used only during gain calibration
+  *   Timeline:
+  *     0ms        → Window opens
+  *     0-20ms     → Samples stored + accumulated (no checks yet)
+  *     20ms+      → EVERY sample: quick threshold check
+  *     20-40ms    → PB1 fires as soon as threshold crossed (typical)
+  *     80ms       → Window closes
+  *     ~82ms      → Stage 2: precise current + PB1 correction
+  *     ~82-100ms  → UART print
+  *     ~100ms     → Next window
   *
   ******************************************************************************
   */
 /* USER CODE END Header */
-
 #include "main.h"
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
 
-/* ============================================================
- *  Peripheral handles
- * ============================================================ */
-TIM_HandleTypeDef  htim1;
+/* ---- Peripheral handles ---- */
+TIM_HandleTypeDef htim1;
 UART_HandleTypeDef huart2;
 
-/* ============================================================
- *  Firmware constants
- * ============================================================ */
-#define SAMPLE_COUNT          100
-#define TICK_NS               15.625f
-#define CAPTURE_WINDOW_MS     80
-#define EARLY_START_MS        10          /* Start early check at 10 ms */
-#define EARLY_MIN_SAMPLES     15          /* Need >= 15 samples          */
-#define MAX_LIVE_SAMPLES      350
+/* ---- Constants ---- */
+#define SAMPLE_COUNT        100
+#define TICK_NS             15.625f
+#define CAPTURE_WINDOW_MS   80
+#define EARLY_START_MS      20         /* Start checking from 20ms */
+#define EARLY_MIN_SAMPLES   30         /* Need at least 30 samples */
+#define MAX_LIVE_SAMPLES    350
+#define AC_DC_THRESHOLD     0.50f
+#define EARLY_MARGIN        1.00f
 
-/* Alarm thresholds (mA) — used for pin control only */
-#define DC_ALERT_MA           6.0f
-#define AC_ALERT_MA           30.0f
-
-/* Hysteresis: alarm clears when current drops to 90% of threshold.
- *
- * The early check (ISR) threshold is derived as: alarm_thresh / HYST_FACTOR
- * = 111% of alarm threshold. This guarantees Stage 2 ALWAYS confirms when
- * early fires — true at ANY threshold value set via Modbus registers:
- *
- *   threshold    early fires at    Stage 2 arms at    Stage 2 clears at
- *    30 mA          33.3 mA           30.0 mA            27.0 mA   ← no overlap
- *    40 mA          44.4 mA           40.0 mA            36.0 mA   ← no overlap
- *   100 mA         111.1 mA          100.0 mA            90.0 mA   ← no overlap
- *
- * Jitter is impossible at any threshold: early only fires when Stage 2
- * will also arm, so they never fight each other. */
-#define ALARM_HYST_FACTOR     0.90f
-
-/* Signal-loss watchdog: clear alarm after this many ms of no samples */
-#define SIGNAL_LOSS_MS        2000UL
+/* ---- Alert thresholds (mA) ---- */
+#define DC_ALERT_MA         6.0f
+#define AC_ALERT_MA         30.0f
 
 /* ============================================================
- *  Modbus constants
- * ============================================================ */
-#define MB_FRAME_BUF          64
-#define MB_INTER_FRAME_MS     5           /* T3.5 silence timeout         */
-#define MB_FC_READ            0x03
-#define MB_FC_WRITE_MULTI     0x10
-#define MB_EX_ILLEGAL_FUNC    0x01
-#define MB_EX_ILLEGAL_ADDR    0x02
-#define MB_EX_ILLEGAL_DATA    0x03
-
-/* Register addresses */
-#define MB_REG_DC_CURRENT     0x0000      /* R   — 0.01 mA/LSB            */
-#define MB_REG_AC_CURRENT     0x0001      /* R   — 0.01 mA/LSB            */
-#define MB_REG_DC_THRESH      0x0002      /* R/W — 0.1 mA/LSB, def=60     */
-#define MB_REG_AC_THRESH      0x0003      /* R/W — 0.1 mA/LSB, def=300    */
-#define MB_REG_SLAVE_ADDR     0x0100      /* R/W — slave address, def=1   */
-
-/* ============================================================
- *  Input capture state machine
+ *  PHASE 1 — Input Capture State Machine
  * ============================================================ */
 volatile uint16_t cap_a1 = 0, cap_b = 0, cap_a2 = 0;
 volatile uint8_t  cap_state = 0;
 
 /* ============================================================
- *  Calibration accumulators
+ *  PHASE 2 — Offset & Measured Gain
  * ============================================================ */
-volatile float    del_t_sum_ns    = 0.0f;
+volatile float    del_t_sum_ns = 0.0f;
 volatile float    del_t_sum_sq_ns = 0.0f;
-volatile uint16_t sample_count    = 0;
+volatile uint16_t sample_count = 0;
 
-volatile float    offset_avg_ns   = 0.0f;
-volatile float    offset_rms_ns   = 0.0f;
-volatile float    mg_ns           = 0.0f;
-volatile float    Cg_ns           = 0.0f;
-volatile float    sensitivity_ns  = 0.0f;
+volatile float    offset_avg_ns = 0.0f;
+volatile float    offset_rms_ns = 0.0f;
+volatile float    mg_ns = 0.0f;
 
 /* ============================================================
- *  Live capture window
+ *  PHASE 3 — Cg, Sensitivity
+ * ============================================================ */
+volatile float    Cg_ns = 0.0f;
+volatile float    sensitivity_ns = 0.0f;
+
+/* ============================================================
+ *  PHASE 4-7 — Live Capture Window
  * ============================================================ */
 volatile float    live_samples_ns[MAX_LIVE_SAMPLES];
-volatile uint16_t live_index       = 0;
-volatile uint8_t  live_capturing   = 0;
+volatile uint16_t live_index = 0;
+volatile uint8_t  live_capturing = 0;
 volatile uint8_t  live_window_done = 0;
-volatile uint32_t live_start_tick  = 0;
+volatile uint32_t live_start_tick = 0;
 
 /* ============================================================
- *  Early alert — ISR-side running accumulators
+ *  Early Alert — ISR-side running accumulators
  * ============================================================ */
-volatile float    early_sum_sq_ns  = 0.0f;
-volatile float    early_sum_ns     = 0.0f;
-volatile uint16_t early_count      = 0;
-volatile uint8_t  early_alert_fired = 0;
-volatile uint32_t early_fire_tick  = 0;
+volatile float    early_sum_sq_ns = 0.0f;
+volatile float    early_sum_ns = 0.0f;
+volatile uint16_t early_count = 0;
+volatile uint8_t  early_has_pos = 0;
+volatile uint8_t  early_has_neg = 0;
+volatile uint8_t  early_alert_fired = 0;    /* 1 = PB1 already set by early check */
+volatile uint32_t early_fire_tick = 0;      /* timestamp when early alert fired */
 
-/* Pre-computed for ISR variance classifier */
-volatile float    offset_rms_sq = 0.0f;
-
-/* ============================================================
- *  Alarm state (persists across windows)
- * ============================================================ */
-volatile uint8_t  alarm_dc_active  = 0;
-volatile uint8_t  alarm_ac_active  = 0;
-volatile uint32_t last_sample_tick = 0;   /* for signal-loss watchdog */
+/* ---- Pre-computed thresholds ---- */
+volatile float    dc_early_current_thresh_ns = 0.0f;   /* |avg-offset| must exceed this */
+volatile float    ac_early_sq_thresh_ns = 0.0f;         /* rms²-offset² must exceed this */
+volatile float    offset_rms_sq = 0.0f;                  /* Pre-computed offset_rms² for ISR speed */
 
 /* ============================================================
- *  Modbus registers (the "database")
- * ============================================================ */
-volatile uint16_t mb_dc_current   = 0;     /* 0x0000 — written by process_capture_window */
-volatile uint16_t mb_ac_current   = 0;     /* 0x0001 — written by process_capture_window */
-volatile uint16_t mb_dc_thresh    = 60;    /* 0x0002 — 60 = 6.0 mA default              */
-volatile uint16_t mb_ac_thresh    = 300;   /* 0x0003 — 300 = 30.0 mA default            */
-volatile uint16_t mb_slave_addr   = 1;     /* 0x0100 — slave address                    */
-
-/* Modbus frame buffers */
-static uint8_t  mb_rx_buf[MB_FRAME_BUF];
-static uint8_t  mb_tx_buf[MB_FRAME_BUF];
-static uint8_t  mb_rx_idx      = 0;
-static uint8_t  mb_rx_len      = 0;
-static uint8_t  mb_frame_ready = 0;
-static uint32_t mb_last_rx_tick = 0;
-
-/* ============================================================
- *  System state machine
+ *  State Machine & Flags
  * ============================================================ */
 typedef enum {
     STATE_IDLE,
@@ -178,666 +119,615 @@ typedef enum {
     STATE_LIVE_CAPTURE
 } SystemState;
 
-volatile SystemState sys_state  = STATE_IDLE;
+volatile SystemState sys_state = STATE_IDLE;
 volatile uint8_t     data_ready = 0;
-volatile uint8_t     cal_status = 0;   /* 1 = calibration complete */
+volatile uint8_t     result_type = 0;
 
-/* ============================================================
- *  Function prototypes
- * ============================================================ */
+/* ---- UART command buffer ---- */
+char cmd_buf[16];
+uint8_t cmd_idx = 0;
+
+/* ---- Function prototypes ---- */
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_USART2_UART_Init(void);
 
-static void auto_calibrate(void);
+static void uart_print(const char *str);
+static void start_offset_measurement(void);
+static void start_mg_measurement(void);
+static void start_live_capture(void);
 static void start_capture_window(void);
 static void compute_early_thresholds(void);
+static void process_command(const char *cmd);
+static void print_offset_result(void);
+static void print_mg_result(void);
+static void print_calibration_summary(void);
 static void process_capture_window(void);
-static void sync_alarm_pins(void);
-
-/* Modbus helpers */
-static uint16_t modbus_crc16(const uint8_t *buf, uint16_t len);
-static uint16_t modbus_read_register(uint16_t addr);
-static uint8_t  modbus_write_register(uint16_t addr, uint16_t value);
-static void     modbus_poll_rx(void);
-static void     modbus_process_frame(void);
-static void     modbus_send(const uint8_t *buf, uint8_t len);
 
 /* ============================================================
- *  CRC-16 (Modbus polynomial 0xA001)
+ *  UART Helper
  * ============================================================ */
-static uint16_t modbus_crc16(const uint8_t *buf, uint16_t len)
+static void uart_print(const char *str)
 {
-    uint16_t crc = 0xFFFF;
-    for (uint16_t i = 0; i < len; i++)
-    {
-        crc ^= buf[i];
-        for (uint8_t b = 0; b < 8; b++)
-        {
-            if (crc & 0x0001)
-                crc = (crc >> 1) ^ 0xA001;
-            else
-                crc >>= 1;
-        }
-    }
-    return crc;
+    HAL_UART_Transmit(&huart2, (uint8_t*)str, strlen(str), HAL_MAX_DELAY);
 }
 
 /* ============================================================
- *  Modbus register read  (returns 0xFFFF for invalid addr)
- * ============================================================ */
-static uint16_t modbus_read_register(uint16_t addr)
-{
-    switch (addr)
-    {
-        case MB_REG_DC_CURRENT:  return mb_dc_current;
-        case MB_REG_AC_CURRENT:  return mb_ac_current;
-        case MB_REG_DC_THRESH:   return mb_dc_thresh;
-        case MB_REG_AC_THRESH:   return mb_ac_thresh;
-        case MB_REG_SLAVE_ADDR:  return mb_slave_addr;
-        default:                 return 0xFFFF;
-    }
-}
-
-/* ============================================================
- *  Modbus register write  (returns 0=OK, 1=illegal addr/data)
- * ============================================================ */
-static uint8_t modbus_write_register(uint16_t addr, uint16_t value)
-{
-    switch (addr)
-    {
-        case MB_REG_DC_THRESH:
-            /* Accept any non-zero value (0 would disable alarm) */
-            if (value == 0) return 1;
-            mb_dc_thresh = value;
-            return 0;
-
-        case MB_REG_AC_THRESH:
-            if (value == 0) return 1;
-            mb_ac_thresh = value;
-            return 0;
-
-        case MB_REG_SLAVE_ADDR:
-            /* Valid slave addresses: 1–247 */
-            if (value < 1 || value > 247) return 1;
-            mb_slave_addr = value;
-            return 0;
-
-        /* Current registers are read-only */
-        case MB_REG_DC_CURRENT:
-        case MB_REG_AC_CURRENT:
-        default:
-            return 1;
-    }
-}
-
-/* ============================================================
- *  Transmit a Modbus response frame
- * ============================================================ */
-static void modbus_send(const uint8_t *buf, uint8_t len)
-{
-    for (uint8_t i = 0; i < len; i++)
-    {
-        while (!(USART2->ISR & USART_ISR_TXE)) {}
-        USART2->TDR = buf[i];
-    }
-}
-
-/* ============================================================
- *  Poll USART2 RX for incoming Modbus bytes.
- *  Call every main-loop iteration (~10 µs).
- *  Sets mb_frame_ready after MB_INTER_FRAME_MS silence.
- * ============================================================ */
-static void modbus_poll_rx(void)
-{
-    /* Accumulate incoming bytes */
-    while (USART2->ISR & USART_ISR_RXNE)
-    {
-        uint8_t ch = (uint8_t)(USART2->RDR & 0xFF);
-        if (mb_rx_idx < MB_FRAME_BUF)
-            mb_rx_buf[mb_rx_idx++] = ch;
-        mb_last_rx_tick = HAL_GetTick();
-        mb_frame_ready  = 0;   /* reset — still receiving */
-    }
-
-    /* Detect end-of-frame: 5 ms silence after last byte */
-    if (mb_rx_idx > 0 && !mb_frame_ready)
-    {
-        if ((HAL_GetTick() - mb_last_rx_tick) >= MB_INTER_FRAME_MS)
-        {
-            mb_rx_len      = mb_rx_idx;
-            mb_rx_idx      = 0;
-            mb_frame_ready = 1;
-        }
-    }
-}
-
-/* ============================================================
- *  Process a complete Modbus frame.
- *  Supports FC 0x03 (Read Holding Registers)
- *  and      FC 0x10 (Write Multiple Registers).
- *  Responds to broadcast address 0x00 (no reply sent).
- * ============================================================ */
-static void modbus_process_frame(void)
-{
-    if (!mb_frame_ready) return;
-    mb_frame_ready = 0;
-
-    /* Minimum frame length: 4 bytes (addr + func + 2 CRC) */
-    if (mb_rx_len < 4) return;
-
-    uint8_t rx_addr = mb_rx_buf[0];
-
-    /* Accept our address or broadcast 0x00 */
-    if (rx_addr != (uint8_t)mb_slave_addr && rx_addr != 0x00) return;
-
-    /* Validate CRC */
-    uint16_t rx_crc   = ((uint16_t)mb_rx_buf[mb_rx_len - 1] << 8) |
-                         (uint16_t)mb_rx_buf[mb_rx_len - 2];
-    uint16_t calc_crc = modbus_crc16(mb_rx_buf, mb_rx_len - 2);
-    if (rx_crc != calc_crc) return;
-
-    uint8_t func = mb_rx_buf[1];
-
-    /* ---- FC 0x03: Read Holding Registers ---- */
-    if (func == MB_FC_READ)
-    {
-        /* Request: [addr][0x03][reg_hi][reg_lo][qty_hi][qty_lo][CRC_lo][CRC_hi] */
-        if (mb_rx_len < 8) return;
-
-        uint16_t start_reg = ((uint16_t)mb_rx_buf[2] << 8) | mb_rx_buf[3];
-        uint16_t num_regs  = ((uint16_t)mb_rx_buf[4] << 8) | mb_rx_buf[5];
-
-        if (num_regs < 1 || num_regs > 10) /* sanity limit */
-        {
-            /* Exception: illegal data value */
-            if (rx_addr == 0x00) return;
-            mb_tx_buf[0] = (uint8_t)mb_slave_addr;
-            mb_tx_buf[1] = 0x83;   /* 0x03 | 0x80 */
-            mb_tx_buf[2] = MB_EX_ILLEGAL_DATA;
-            uint16_t crc = modbus_crc16(mb_tx_buf, 3);
-            mb_tx_buf[3] = (uint8_t)(crc & 0xFF);
-            mb_tx_buf[4] = (uint8_t)(crc >> 8);
-            modbus_send(mb_tx_buf, 5);
-            return;
-        }
-
-        /* Check all requested registers are valid */
-        for (uint16_t i = 0; i < num_regs; i++)
-        {
-            if (modbus_read_register(start_reg + i) == 0xFFFF &&
-                start_reg + i != MB_REG_DC_CURRENT &&   /* 0x0000 could legitimately be 0 */
-                start_reg + i != MB_REG_AC_CURRENT)
-            {
-                /* Attempt to read a register we don't know */
-                uint16_t reg = start_reg + i;
-                if (reg != MB_REG_DC_CURRENT && reg != MB_REG_AC_CURRENT &&
-                    reg != MB_REG_DC_THRESH   && reg != MB_REG_AC_THRESH &&
-                    reg != MB_REG_SLAVE_ADDR)
-                {
-                    if (rx_addr == 0x00) return;
-                    mb_tx_buf[0] = (uint8_t)mb_slave_addr;
-                    mb_tx_buf[1] = 0x83;
-                    mb_tx_buf[2] = MB_EX_ILLEGAL_ADDR;
-                    uint16_t crc2 = modbus_crc16(mb_tx_buf, 3);
-                    mb_tx_buf[3] = (uint8_t)(crc2 & 0xFF);
-                    mb_tx_buf[4] = (uint8_t)(crc2 >> 8);
-                    modbus_send(mb_tx_buf, 5);
-                    return;
-                }
-            }
-        }
-
-        /* Build response */
-        uint8_t byte_count = (uint8_t)(num_regs * 2);
-        mb_tx_buf[0] = (uint8_t)mb_slave_addr;
-        mb_tx_buf[1] = MB_FC_READ;
-        mb_tx_buf[2] = byte_count;
-
-        for (uint16_t i = 0; i < num_regs; i++)
-        {
-            uint16_t val = modbus_read_register(start_reg + i);
-            mb_tx_buf[3 + i * 2]     = (uint8_t)(val >> 8);    /* big-endian */
-            mb_tx_buf[3 + i * 2 + 1] = (uint8_t)(val & 0xFF);
-        }
-
-        uint8_t  resp_len = 3 + byte_count;
-        uint16_t crc3     = modbus_crc16(mb_tx_buf, resp_len);
-        mb_tx_buf[resp_len]     = (uint8_t)(crc3 & 0xFF);
-        mb_tx_buf[resp_len + 1] = (uint8_t)(crc3 >> 8);
-
-        if (rx_addr != 0x00)   /* no reply to broadcast */
-            modbus_send(mb_tx_buf, resp_len + 2);
-        return;
-    }
-
-    /* ---- FC 0x10: Write Multiple Registers ---- */
-    if (func == MB_FC_WRITE_MULTI)
-    {
-        /*
-         * Request:
-         * [addr][0x10][reg_hi][reg_lo][qty_hi][qty_lo][byte_cnt]
-         * [data_hi_0][data_lo_0] ... [CRC_lo][CRC_hi]
-         */
-        if (mb_rx_len < 9) return;
-
-        uint16_t start_reg  = ((uint16_t)mb_rx_buf[2] << 8) | mb_rx_buf[3];
-        uint16_t num_regs   = ((uint16_t)mb_rx_buf[4] << 8) | mb_rx_buf[5];
-        uint8_t  byte_count = mb_rx_buf[6];
-
-        if (num_regs < 1 || byte_count != (uint8_t)(num_regs * 2) ||
-            mb_rx_len < (uint8_t)(7 + byte_count + 2))
-        {
-            if (rx_addr == 0x00) return;
-            mb_tx_buf[0] = (uint8_t)mb_slave_addr;
-            mb_tx_buf[1] = 0x90;
-            mb_tx_buf[2] = MB_EX_ILLEGAL_DATA;
-            uint16_t crc = modbus_crc16(mb_tx_buf, 3);
-            mb_tx_buf[3] = (uint8_t)(crc & 0xFF);
-            mb_tx_buf[4] = (uint8_t)(crc >> 8);
-            modbus_send(mb_tx_buf, 5);
-            return;
-        }
-
-        /* Write each register */
-        for (uint16_t i = 0; i < num_regs; i++)
-        {
-            uint16_t val = ((uint16_t)mb_rx_buf[7 + i * 2] << 8) |
-                            (uint16_t)mb_rx_buf[8 + i * 2];
-            if (modbus_write_register(start_reg + i, val) != 0)
-            {
-                if (rx_addr == 0x00) return;
-                mb_tx_buf[0] = (uint8_t)mb_slave_addr;
-                mb_tx_buf[1] = 0x90;
-                mb_tx_buf[2] = MB_EX_ILLEGAL_DATA;
-                uint16_t crc = modbus_crc16(mb_tx_buf, 3);
-                mb_tx_buf[3] = (uint8_t)(crc & 0xFF);
-                mb_tx_buf[4] = (uint8_t)(crc >> 8);
-                modbus_send(mb_tx_buf, 5);
-                return;
-            }
-        }
-
-        /* Echo response: [addr][0x10][reg_hi][reg_lo][qty_hi][qty_lo][CRC] */
-        mb_tx_buf[0] = (uint8_t)mb_slave_addr;
-        mb_tx_buf[1] = MB_FC_WRITE_MULTI;
-        mb_tx_buf[2] = mb_rx_buf[2];
-        mb_tx_buf[3] = mb_rx_buf[3];
-        mb_tx_buf[4] = mb_rx_buf[4];
-        mb_tx_buf[5] = mb_rx_buf[5];
-        uint16_t crc4 = modbus_crc16(mb_tx_buf, 6);
-        mb_tx_buf[6] = (uint8_t)(crc4 & 0xFF);
-        mb_tx_buf[7] = (uint8_t)(crc4 >> 8);
-
-        if (rx_addr != 0x00)
-            modbus_send(mb_tx_buf, 8);
-        return;
-    }
-
-    /* ---- Unsupported function code ---- */
-    if (rx_addr != 0x00)
-    {
-        mb_tx_buf[0] = (uint8_t)mb_slave_addr;
-        mb_tx_buf[1] = func | 0x80;
-        mb_tx_buf[2] = MB_EX_ILLEGAL_FUNC;
-        uint16_t crc = modbus_crc16(mb_tx_buf, 3);
-        mb_tx_buf[3] = (uint8_t)(crc & 0xFF);
-        mb_tx_buf[4] = (uint8_t)(crc >> 8);
-        modbus_send(mb_tx_buf, 5);
-    }
-}
-
-/* ============================================================
- *  Compute early alert thresholds (called after calibration)
+ *  Compute Early Alert Thresholds
  * ============================================================ */
 static void compute_early_thresholds(void)
 {
-    /* Only offset_rms² is pre-computed for ISR speed.
-     * The actual early alarm thresholds are derived dynamically in the ISR
-     * from the live mb_ac_thresh / mb_dc_thresh Modbus registers so that
-     * any threshold change written via Modbus takes effect immediately. */
+    /* DC: |quick_avg - offset_avg| > this value */
+    dc_early_current_thresh_ns = DC_ALERT_MA * EARLY_MARGIN * fabsf(sensitivity_ns);
+
+    /* AC: (quick_rms² - offset_rms²) > this value (squared, no sqrt in ISR) */
+    float ac_signal_ns = AC_ALERT_MA * EARLY_MARGIN * fabsf(sensitivity_ns);
+    ac_early_sq_thresh_ns = ac_signal_ns * ac_signal_ns;
+
+    /* Pre-compute offset_rms² so ISR doesn't recompute it every sample */
     offset_rms_sq = offset_rms_ns * offset_rms_ns;
 }
 
 /* ============================================================
- *  Sync alarm output pins from alarm state variables
+ *  PHASE 2 — Start Offset Measurement
  * ============================================================ */
-static void sync_alarm_pins(void)
+static void start_offset_measurement(void)
 {
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4,
-                      alarm_dc_active ? GPIO_PIN_SET : GPIO_PIN_RESET);  /* DC alarm */
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3,
-                      alarm_ac_active ? GPIO_PIN_SET : GPIO_PIN_RESET);  /* AC alarm */
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1,
-                      (alarm_dc_active || alarm_ac_active) ? GPIO_PIN_SET : GPIO_PIN_RESET);  /* AC+DC combined */
+    sample_count = 0;
+    del_t_sum_ns = 0.0f;
+    del_t_sum_sq_ns = 0.0f;
+    cap_state = 0;
+    data_ready = 0;
+    sys_state = STATE_OFFSET_SAMPLING;
 }
 
 /* ============================================================
- *  Start one 80 ms capture window
+ *  PHASE 2 — Start MG Measurement
+ * ============================================================ */
+static void start_mg_measurement(void)
+{
+    sample_count = 0;
+    del_t_sum_ns = 0.0f;
+    del_t_sum_sq_ns = 0.0f;
+    cap_state = 0;
+    data_ready = 0;
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_SET);
+    sys_state = STATE_MG_SAMPLING;
+}
+
+/* ============================================================
+ *  PHASE 4 — Start Live Capture Mode
+ * ============================================================ */
+static void start_live_capture(void)
+{
+    cap_state = 0;
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET);
+    sys_state = STATE_LIVE_CAPTURE;
+    start_capture_window();
+}
+
+/* ============================================================
+ *  Start a single 80ms capture window
  * ============================================================ */
 static void start_capture_window(void)
 {
-    live_index     = 0;
+    live_index = 0;
     live_capturing = 1;
     live_window_done = 0;
-    cap_state      = 0;
+    cap_state = 0;
 
-    early_sum_sq_ns   = 0.0f;
-    early_sum_ns      = 0.0f;
-    early_count       = 0;
+    early_sum_sq_ns = 0.0f;
+    early_sum_ns = 0.0f;
+    early_count = 0;
+    early_has_pos = 0;
+    early_has_neg = 0;
     early_alert_fired = 0;
-    early_fire_tick   = 0;
+    early_fire_tick = 0;
 
     live_start_tick = HAL_GetTick();
 }
 
 /* ============================================================
- *  Auto-calibration: runs once on boot.
- *  Phase 1 — offset (no current)  ~400 ms + 1 s stabilise wait
- *  Phase 2 — gain  (24 mA ref)    ~400 ms + 500 ms settle
+ *  Command Processing
  * ============================================================ */
-static void auto_calibrate(void)
+static void process_command(const char *cmd)
 {
-    /* --- 1-second timer stabilisation --- */
-    HAL_Delay(1000);
-
-    /* --- Offset measurement --- */
-    sample_count      = 0;
-    del_t_sum_ns      = 0.0f;
-    del_t_sum_sq_ns   = 0.0f;
-    cap_state         = 0;
-    data_ready        = 0;
-    sys_state         = STATE_OFFSET_SAMPLING;
-
-    while (sys_state == STATE_OFFSET_SAMPLING)
+    if (strcmp(cmd, "0x001") == 0)
     {
-        /* Spin — ISR will set sys_state = STATE_OFFSET_DONE */
+        uart_print("PHASE 2: Measuring Offset (100 samples)...\r\n");
+        uart_print("  Computing BOTH average and RMS offset.\r\n");
+        start_offset_measurement();
     }
-
-    offset_avg_ns = del_t_sum_ns      / (float)SAMPLE_COUNT;
-    offset_rms_ns = sqrtf(del_t_sum_sq_ns / (float)SAMPLE_COUNT);
-    sys_state     = STATE_IDLE;
-    HAL_Delay(500);
-
-    /* --- Gain measurement --- */
-    sample_count    = 0;
-    del_t_sum_ns    = 0.0f;
-    del_t_sum_sq_ns = 0.0f;
-    cap_state       = 0;
-    data_ready      = 0;
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_SET);   /* inject 24 mA */
-    HAL_Delay(500);                                         /* settle        */
-    sys_state = STATE_MG_SAMPLING;
-
-    while (sys_state == STATE_MG_SAMPLING)
+    else if (strcmp(cmd, "0x002") == 0)
     {
-        /* Spin — ISR will set sys_state = STATE_MG_DONE */
+        if (sys_state == STATE_IDLE && offset_avg_ns == 0.0f && offset_rms_ns == 0.0f)
+        {
+            uart_print("ERROR: Take offset first (0x001)\r\n");
+            return;
+        }
+        uart_print("PHASE 2: PA12 HIGH - Measuring Gain (100 samples)...\r\n");
+        start_mg_measurement();
     }
-
-    mg_ns  = del_t_sum_ns / (float)SAMPLE_COUNT;
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_RESET); /* remove 24 mA */
-
-    Cg_ns          = mg_ns - offset_avg_ns;
-    sensitivity_ns = (Cg_ns != 0.0f) ? (Cg_ns / 24.0f) : 0.0f;
-
-    compute_early_thresholds();
-
-    cal_status = 1;
-    sys_state  = STATE_IDLE;
+    else if (strcmp(cmd, "0x003") == 0)
+    {
+        if (sensitivity_ns == 0.0f)
+        {
+            uart_print("ERROR: Complete calibration first (0x001 then 0x002)\r\n");
+            return;
+        }
+        uart_print("PHASE 4: Starting live capture (80ms windows)...\r\n");
+        uart_print("  DC: signed avg | AC: quadratic RMS + trimming\r\n");
+        uart_print("  Continuous early check from 20ms onward\r\n");
+        uart_print("  Send 0x004 to stop.\r\n\r\n");
+        start_live_capture();
+    }
+    else if (strcmp(cmd, "0x004") == 0)
+    {
+        sys_state = STATE_IDLE;
+        cap_state = 0;
+        live_capturing = 0;
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET);
+        uart_print("\r\nLive capture STOPPED. PB1 OFF.\r\n\r\n");
+    }
+    else
+    {
+        uart_print("Commands: 0x001 (offset), 0x002 (gain), 0x003 (live), 0x004 (stop)\r\n");
+    }
 }
 
 /* ============================================================
- *  Process one completed 80 ms window (main loop — NOT ISR)
+ *  Print Functions
+ * ============================================================ */
+static void print_offset_result(void)
+{
+    char buf[128];
+    uart_print("\r\n========== OFFSET (Phase 2) ==========\r\n");
+    sprintf(buf, "  Samples:      %d\r\n", SAMPLE_COUNT);
+    uart_print(buf);
+    sprintf(buf, "  Offset(avg):  %.2f ns   [for DC]\r\n", offset_avg_ns);
+    uart_print(buf);
+    sprintf(buf, "  Offset(rms):  %.2f ns   [for AC]\r\n", offset_rms_ns);
+    uart_print(buf);
+    uart_print("  Now send 0x002 for Gain measurement.\r\n");
+    uart_print("=======================================\r\n\r\n");
+}
+
+static void print_mg_result(void)
+{
+    char buf[128];
+    uart_print("\r\n========== MEASURED GAIN (Phase 2) ==========\r\n");
+    sprintf(buf, "  Samples: %d   MG: %.2f ns\r\n", SAMPLE_COUNT, mg_ns);
+    uart_print(buf);
+    uart_print("===============================================\r\n\r\n");
+}
+
+static void print_calibration_summary(void)
+{
+    char buf[128];
+    uart_print("========== CALIBRATION COMPLETE (Phase 3) ==========\r\n");
+    sprintf(buf, "  Offset(avg): %.2f ns  Offset(rms): %.2f ns\r\n", offset_avg_ns, offset_rms_ns);
+    uart_print(buf);
+    sprintf(buf, "  MG: %.2f ns  Cg: %.2f ns  Sens: %.6f ns/mA\r\n", mg_ns, Cg_ns, sensitivity_ns);
+    uart_print(buf);
+    sprintf(buf, "  DC early thresh: %.2f ns (%.1f mA)\r\n",
+            dc_early_current_thresh_ns, DC_ALERT_MA * EARLY_MARGIN);
+    uart_print(buf);
+    sprintf(buf, "  AC early thresh: %.2f ns^2 (%.1f mA)\r\n",
+            ac_early_sq_thresh_ns, AC_ALERT_MA * EARLY_MARGIN);
+    uart_print(buf);
+    uart_print("  Send 0x003 to start live capture.\r\n");
+    uart_print("====================================================\r\n\r\n");
+}
+
+/* ============================================================
+ *  PHASE 4-7: Process one completed 80ms capture window
  *
- *  CLASSIFIER: variance-based (immune to window phase and timing jitter)
- *
- *    variance = rms² - avg²
- *    DC signal: variance ≈ offset_rms²            (noise floor only)
- *    AC signal: variance = (I_rms × sensitivity)² >> offset_rms²
- *
- *    Threshold = 4 × offset_rms² → detects AC ≥ ~3 mA RMS reliably.
- *    Immune to partial-cycle window alignment and HAL_GetTick ±0.5 ms jitter.
- *
- *  AC FORMULA: I = sqrt(variance) / sensitivity   (= sqrt(rms² - avg²) / sens)
- *    avg² removes the DC offset contribution; no cycle trimming needed.
- *    Works for any AC frequency; no zero-crossing dependency.
+ *  Stage 2 — PRECISION (identical to v13.6):
+ *    DC: signed average → direction-aware current
+ *    AC: cycle trimming → RMS → quadratic offset
+ *    PB1 CORRECTED based on precise value
+ *    UART output with early alert timing info
  * ============================================================ */
 static void process_capture_window(void)
 {
+    char buf[256];
     uint16_t n = live_index;
-    if (n < 2) return;
 
-    /* ---- Pass 1: scan all samples ---- */
+    if (n < 2)
+    {
+        uart_print("  Not enough samples.\r\n");
+        return;
+    }
+
+    /* ================================================================
+     *  PASS 1: Scan all samples
+     * ================================================================ */
     float sum_dt_ns = 0.0f;
     float sum_sq_ns = 0.0f;
+    float max_dt_ns = live_samples_ns[0];
+    float min_dt_ns = live_samples_ns[0];
+    uint8_t has_positive = 0;
+    uint8_t has_negative = 0;
 
     for (uint16_t i = 0; i < n; i++)
     {
-        float dt = live_samples_ns[i];
-        sum_dt_ns += dt;
-        sum_sq_ns += dt * dt;
+        float dt_ns = live_samples_ns[i];
+        sum_dt_ns += dt_ns;
+        sum_sq_ns += dt_ns * dt_ns;
+        if (dt_ns > max_dt_ns) max_dt_ns = dt_ns;
+        if (dt_ns < min_dt_ns) min_dt_ns = dt_ns;
+        if (dt_ns > 0.0f) has_positive = 1;
+        if (dt_ns < 0.0f) has_negative = 1;
     }
 
     float avg_cycle_ns = sum_dt_ns / (float)n;
-    float rms_sq_ns    = sum_sq_ns / (float)n;
 
-    /* ---- AC/DC classification: variance-based ---- */
-    /*
-     * variance = rms² - avg²
-     * DC:  variance ≈ offset_rms²  (signal is flat; only noise contributes)
-     * AC:  variance = (I_rms × sensitivity)² which is >> offset_rms²
-     *      even at 9 mA AC: (9 × 37.62)² = 114,636 ns² vs threshold 12,996 ns²
-     *
-     * Previous avg_deviation check was broken: a 50 Hz AC signal captured
-     * in a window with ±0.5 ms HAL_GetTick jitter produces avg_deviation
-     * up to 416 ns (50 mA AC) >> offset_rms (57 ns) → wrongly classified DC.
-     * Variance is immune because avg² cancels regardless of phase offset.
-     */
-    float variance_ns   = rms_sq_ns - (avg_cycle_ns * avg_cycle_ns);
-    float var_threshold = 4.0f * offset_rms_ns * offset_rms_ns;  /* 4 × noise floor */
+    /* ---- AC/DC Classification ---- */
+    uint8_t is_ac = 0;
 
-    uint8_t is_ac = (variance_ns > var_threshold) ? 1 : 0;
+    if (has_positive && has_negative)
+    {
+        is_ac = 1;
+    }
 
-    /* ---- Current calculation ---- */
-    float current_mA  = 0.0f;
-    float abs_current = 0.0f;
+    if (!is_ac)
+    {
+        float avg_abs = fabsf(avg_cycle_ns);
+        if (avg_abs > 0.0f)
+        {
+            float variation = (max_dt_ns - min_dt_ns) / avg_abs;
+            if (variation > AC_DC_THRESHOLD)
+            {
+                is_ac = 1;
+            }
+        }
+    }
+
+    /* ================================================================
+     *  Current Calculation
+     * ================================================================ */
+    float current_mA = 0.0f;
+    const char *sig_label;
+    float offset_used_ns;
+    uint16_t trimmed_cycles = 0;
+    uint16_t rms_n = n;
+    float del_t_rms_ns = 0.0f;
 
     if (is_ac)
     {
-        /*
-         * I_ac = sqrt(variance) / sensitivity
-         *      = sqrt(rms² - avg²) / sensitivity
-         *
-         * avg² removes the DC hardware offset contribution.
-         * No cycle trimming needed: variance is phase-invariant.
-         */
-        if (sensitivity_ns != 0.0f && variance_ns > 0.0f)
-            current_mA = sqrtf(variance_ns) / fabsf(sensitivity_ns);
-        abs_current = current_mA;
+        sig_label = "AC/quad";
+        offset_used_ns = offset_rms_ns;
+
+        /* ---- Cycle trimming ---- */
+        uint16_t rms_start = 0;
+        uint16_t rms_end = n;
+
+        uint16_t first_crossing = 0;
+        uint16_t last_crossing = 0;
+        uint8_t  found_first = 0;
+        uint16_t crossing_count = 0;
+
+        for (uint16_t i = 1; i < n; i++)
+        {
+            if (live_samples_ns[i - 1] <= 0.0f && live_samples_ns[i] > 0.0f)
+            {
+                crossing_count++;
+                if (!found_first)
+                {
+                    first_crossing = i;
+                    found_first = 1;
+                }
+                last_crossing = i;
+            }
+        }
+
+        if (crossing_count >= 2)
+        {
+            rms_start = first_crossing;
+            rms_end = last_crossing;
+            trimmed_cycles = crossing_count - 1;
+        }
+
+        rms_n = rms_end - rms_start;
+        if (rms_n < 2) { rms_start = 0; rms_end = n; rms_n = n; }
+
+        float trim_sum_sq = 0.0f;
+        for (uint16_t i = rms_start; i < rms_end; i++)
+        {
+            float dt_ns = live_samples_ns[i];
+            trim_sum_sq += dt_ns * dt_ns;
+        }
+
+        del_t_rms_ns = sqrtf(trim_sum_sq / (float)rms_n);
+
+        /* Quadratic AC offset */
+        if (sensitivity_ns != 0.0f)
+        {
+            float rms_sq = del_t_rms_ns * del_t_rms_ns;
+            float off_sq = offset_rms_ns * offset_rms_ns;
+
+            if (rms_sq > off_sq)
+                current_mA = sqrtf(rms_sq - off_sq) / sensitivity_ns;
+            else
+                current_mA = 0.0f;
+        }
     }
     else
     {
         /* DC: signed average */
+        sig_label = "DC/lin";
+        offset_used_ns = offset_avg_ns;
+
         if (sensitivity_ns != 0.0f)
+        {
             current_mA = (avg_cycle_ns - offset_avg_ns) / sensitivity_ns;
-        abs_current = fabsf(current_mA);
+        }
     }
 
-    /* ---- Write Modbus registers ---- */
-    if (is_ac)
-    {
-        mb_dc_current = 0;
-        mb_ac_current = (uint16_t)(abs_current * 100.0f + 0.5f);
-    }
-    else
-    {
-        mb_dc_current = (uint16_t)(abs_current * 100.0f + 0.5f);
-        mb_ac_current = 0;
-    }
+    float abs_current = fabsf(current_mA);
 
-    /* ---- Evaluate alarms against Modbus thresholds ---- */
-    /*
-     * mb_dc_thresh is in 0.1 mA units → divide by 10.0 for mA comparison
-     * mb_ac_thresh is in 0.1 mA units → divide by 10.0 for mA comparison
-     */
-    float dc_thresh_mA = (float)mb_dc_thresh / 10.0f;
-    float ac_thresh_mA = (float)mb_ac_thresh / 10.0f;
+    /* ================================================================
+     *  PB1 CORRECTION — Stage 2 overrides Stage 1
+     * ================================================================ */
+    uint8_t pb1_state = 0;
 
     if (is_ac)
     {
-        if (abs_current >= ac_thresh_mA)
-            alarm_ac_active = 1;
-        else if (abs_current < ac_thresh_mA * ALARM_HYST_FACTOR)
-            alarm_ac_active = 0;
-
-        alarm_dc_active = 0;
+        if (abs_current >= AC_ALERT_MA)
+        {
+            HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_1);
+            pb1_state = 2;
+        }
+        else
+        {
+            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET);
+            pb1_state = 0;
+        }
     }
     else
     {
-        if (abs_current >= dc_thresh_mA)
-            alarm_dc_active = 1;
-        else if (abs_current < dc_thresh_mA * ALARM_HYST_FACTOR)
-            alarm_dc_active = 0;
-
-        alarm_ac_active = 0;
+        if (abs_current >= DC_ALERT_MA)
+        {
+            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);
+            pb1_state = 1;
+        }
+        else
+        {
+            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET);
+            pb1_state = 0;
+        }
     }
 
-    sync_alarm_pins();
+    /* ================================================================
+     *  UART Output
+     * ================================================================ */
+    uart_print("--------------------------------------------\r\n");
 
-    /* Update signal-loss watchdog */
-    last_sample_tick = HAL_GetTick();
+    if (is_ac && trimmed_cycles > 0)
+    {
+        sprintf(buf, "  Cap:%d  Trim:%d (%dcyc)  %s\r\n",
+                n, rms_n, trimmed_cycles, sig_label);
+    }
+    else
+    {
+        sprintf(buf, "  Cap:%d  %s\r\n", n, sig_label);
+    }
+    uart_print(buf);
+
+    sprintf(buf, "  Max:%.2f  Min:%.2f  Avg:%.2f ns\r\n",
+            max_dt_ns, min_dt_ns, avg_cycle_ns);
+    uart_print(buf);
+
+    if (is_ac)
+    {
+        sprintf(buf, "  delTrms:%.2f  Offset:%.2f ns\r\n",
+                del_t_rms_ns, offset_used_ns);
+        uart_print(buf);
+    }
+    else
+    {
+        sprintf(buf, "  Offset:%.2f ns  Sens:%.4f ns/mA\r\n",
+                offset_used_ns, sensitivity_ns);
+        uart_print(buf);
+    }
+
+    /* Current line with early alert timing */
+    if (is_ac)
+    {
+        sprintf(buf, "  I:%.4f mA", current_mA);
+    }
+    else
+    {
+        sprintf(buf, "  I:%.4f mA  |I|:%.4f mA", current_mA, abs_current);
+    }
+    uart_print(buf);
+
+    if (early_alert_fired)
+    {
+        uint32_t fire_ms = early_fire_tick - live_start_tick;
+        sprintf(buf, "  Early:%lums", (unsigned long)fire_ms);
+    }
+    else
+    {
+        sprintf(buf, "  Early:no");
+    }
+    uart_print(buf);
+
+    if (pb1_state == 1)
+        uart_print("  PB1:HIGH\r\n");
+    else if (pb1_state == 2)
+        uart_print("  PB1:BLINK\r\n");
+    else
+        uart_print("  PB1:LOW\r\n");
+
+    uart_print("--------------------------------------------\r\n");
 }
 
 /* ============================================================
  *  Timer Input Capture ISR
+ *
+ *  v13.7 KEY CHANGE:
+ *    Stage 1 checks EVERY SAMPLE from EARLY_START_MS (20ms) onward.
+ *    As soon as running accumulator crosses threshold → PB1 fires.
+ *    No single checkpoint — continuous monitoring.
+ *
+ *    Per-sample cost:
+ *      AC: one divide + one subtract + one compare (~150ns)
+ *      DC: one divide + one fabsf + one compare (~150ns)
+ *      No sqrt ever. offset_rms² pre-computed.
  * ============================================================ */
 void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
 {
     if (sys_state == STATE_IDLE) return;
     if (htim->Instance != TIM1) return;
 
-    /* ---- CH1: A1 or A2 ---- */
     if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1)
     {
         uint16_t capture = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
 
         if (cap_state == 0)
         {
-            cap_a1    = capture;
+            cap_a1 = capture;
             cap_state = 1;
         }
         else if (cap_state == 2)
         {
             cap_a2 = capture;
 
-            uint16_t t1_ticks = cap_b  - cap_a1;
+            uint16_t t1_ticks = cap_b - cap_a1;
             uint16_t t2_ticks = cap_a2 - cap_b;
-            float    t1_ns    = (float)t1_ticks * TICK_NS;
-            float    t2_ns    = (float)t2_ticks * TICK_NS;
-            float    del_t_ns = t1_ns - t2_ns;
+
+            float t1_ns = (float)t1_ticks * TICK_NS;
+            float t2_ns = (float)t2_ticks * TICK_NS;
+
+            float del_t_ns = t1_ns - t2_ns;
 
             /* ---- Offset sampling ---- */
             if (sys_state == STATE_OFFSET_SAMPLING)
             {
-                del_t_sum_ns    += del_t_ns;
+                del_t_sum_ns += del_t_ns;
                 del_t_sum_sq_ns += del_t_ns * del_t_ns;
                 sample_count++;
+
                 if (sample_count >= SAMPLE_COUNT)
+                {
+                    offset_avg_ns = del_t_sum_ns / (float)SAMPLE_COUNT;
+                    offset_rms_ns = sqrtf(del_t_sum_sq_ns / (float)SAMPLE_COUNT);
+
                     sys_state = STATE_OFFSET_DONE;
+                    result_type = 0;
+                    data_ready = 1;
+                }
             }
-            /* ---- Gain sampling ---- */
+            /* ---- MG sampling ---- */
             else if (sys_state == STATE_MG_SAMPLING)
             {
                 del_t_sum_ns += del_t_ns;
                 sample_count++;
+
                 if (sample_count >= SAMPLE_COUNT)
+                {
+                    mg_ns = del_t_sum_ns / (float)SAMPLE_COUNT;
+
+                    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_RESET);
+
+                    Cg_ns = mg_ns - offset_avg_ns;
+
+                    if (Cg_ns != 0.0f)
+                        sensitivity_ns = Cg_ns / 24.0f;
+                    else
+                        sensitivity_ns = 0.0f;
+
+                    compute_early_thresholds();
+
                     sys_state = STATE_MG_DONE;
+                    result_type = 1;
+                    data_ready = 1;
+                }
             }
-            /* ---- Live capture with continuous early alert ---- */
+            /* ---- Live capture with CONTINUOUS early alert ---- */
             else if (sys_state == STATE_LIVE_CAPTURE && live_capturing)
             {
                 uint32_t elapsed = HAL_GetTick() - live_start_tick;
 
                 if (elapsed < CAPTURE_WINDOW_MS)
                 {
-                    /* Store sample */
+                    /* Store sample in buffer */
                     if (live_index < MAX_LIVE_SAMPLES)
+                    {
                         live_samples_ns[live_index++] = del_t_ns;
+                    }
 
                     /* Accumulate for early check */
                     early_sum_sq_ns += del_t_ns * del_t_ns;
-                    early_sum_ns    += del_t_ns;
+                    early_sum_ns += del_t_ns;
                     early_count++;
+                    if (del_t_ns > 0.0f) early_has_pos = 1;
+                    if (del_t_ns < 0.0f) early_has_neg = 1;
 
-                    /* Continuous early threshold check */
+                    /* ============================================
+                     *  ★ CONTINUOUS EARLY CHECK ★
+                     *
+                     *  Checks EVERY sample from 20ms onward
+                     *  (with minimum 30 samples for stability).
+                     *
+                     *  Once fired, stops checking (early_alert_fired=1).
+                     *  Stage 2 will correct if it was a false alarm.
+                     *
+                     *  Per-sample cost: ~150ns (no sqrt ever)
+                     * ============================================ */
                     if (!early_alert_fired &&
                         elapsed >= EARLY_START_MS &&
                         early_count >= EARLY_MIN_SAMPLES)
                     {
-                        /*
-                         * Early check uses the same variance logic as Stage 2.
-                         *
-                         * variance = rms² - avg²
-                         * AC: variance >> var_threshold → fire AC alarm (PB3 + PB1)
-                         * DC: variance ≤ var_threshold → fire DC alarm if avg signal large (PB4 + PB1)
-                         *
-                         * Previous quick_ac = (has_pos && has_neg) was broken:
-                         * with only 15 samples (~0.75 cycle at 50 Hz) the window
-                         * may capture only the positive half → has_neg stays 0
-                         * → treated as DC → fired on half-wave amplitude.
-                         *
-                         * No sqrt in ISR: compare signal² against threshold² directly.
-                         */
-                        float inv_n        = 1.0f / (float)early_count;
-                        float quick_rms_sq = early_sum_sq_ns * inv_n;
-                        float quick_avg    = early_sum_ns    * inv_n;
-                        float quick_var    = quick_rms_sq - (quick_avg * quick_avg);
+                        /* Quick AC/DC: zero crossing only */
+                        uint8_t quick_ac = (early_has_pos && early_has_neg) ? 1 : 0;
 
-                        /* var_threshold = 4 × offset_rms² (pre-computed) */
-                        float var_thr = 4.0f * offset_rms_sq;
+                        float inv_count = 1.0f / (float)early_count;
 
-                        /*
-                         * Early thresholds derived dynamically from live Modbus registers.
-                         * early = mb_thresh / HYST_FACTOR = mb_thresh / 0.90 = mb_thresh × 1.111
-                         * This holds for ANY threshold value written via Modbus:
-                         *   mb_ac_thresh in 0.1 mA units → /10 → mA → × sensitivity → ns → squared
-                         */
-                        float early_inv_hyst = 1.0f / ALARM_HYST_FACTOR;   /* 1.111 */
-                        float ac_early_ns    = ((float)mb_ac_thresh * 0.1f) * early_inv_hyst * fabsf(sensitivity_ns);
-                        float dc_early_ns    = ((float)mb_dc_thresh * 0.1f) * early_inv_hyst * fabsf(sensitivity_ns);
-
-                        if (quick_var > var_thr)
+                        if (quick_ac)
                         {
-                            /* AC signal — compare variance against dynamic early threshold² */
-                            if (quick_var > ac_early_ns * ac_early_ns)
+                            /*
+                             * AC CHECK (no sqrt):
+                             *   quick_rms² = sum_sq / count
+                             *   signal²    = quick_rms² - offset_rms²
+                             *   fire if signal² > ac_early_sq_thresh
+                             */
+                            float quick_rms_sq = early_sum_sq_ns * inv_count;
+                            float signal_sq = quick_rms_sq - offset_rms_sq;
+
+                            if (signal_sq > ac_early_sq_thresh_ns)
                             {
-                                alarm_ac_active = 1;
-                                HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3, GPIO_PIN_SET);   /* AC alarm */
-                                HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);   /* combined */
+                                HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_1);
                                 early_alert_fired = 1;
-                                early_fire_tick   = HAL_GetTick();
+                                early_fire_tick = HAL_GetTick();
                             }
                         }
                         else
                         {
-                            /* DC signal — compare avg signal against dynamic early threshold */
-                            float dc_signal = fabsf(quick_avg - offset_avg_ns);
-                            if (dc_signal > dc_early_ns)
+                            /*
+                             * DC CHECK (signed average, no sqrt):
+                             *   quick_avg = sum / count
+                             *   signal    = |quick_avg - offset_avg|
+                             *   fire if signal > dc_early_current_thresh
+                             */
+                            float quick_avg = early_sum_ns * inv_count;
+                            float dc_signal_ns = fabsf(quick_avg - offset_avg_ns);
+
+                            if (dc_signal_ns > dc_early_current_thresh_ns)
                             {
-                                alarm_dc_active = 1;
-                                HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4, GPIO_PIN_SET);   /* DC alarm */
-                                HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);   /* combined */
+                                HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);
                                 early_alert_fired = 1;
-                                early_fire_tick   = HAL_GetTick();
+                                early_fire_tick = HAL_GetTick();
                             }
                         }
                     }
                 }
                 else
                 {
-                    /* 80 ms elapsed — close window */
-                    live_capturing   = 0;
+                    /* 80ms elapsed — window complete */
+                    live_capturing = 0;
                     live_window_done = 1;
                 }
             }
@@ -846,12 +736,11 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
         }
     }
 
-    /* ---- CH2: B ---- */
     if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2)
     {
         if (cap_state == 1)
         {
-            cap_b     = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_2);
+            cap_b = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_2);
             cap_state = 2;
         }
     }
@@ -866,50 +755,85 @@ int main(void)
     SystemClock_Config();
     MX_GPIO_Init();
     MX_TIM1_Init();
-    MX_USART2_UART_Init();   /* 9600 baud for Modbus RTU */
+    MX_USART2_UART_Init();
 
     HAL_TIM_IC_Start_IT(&htim1, TIM_CHANNEL_1);
     HAL_TIM_IC_Start_IT(&htim1, TIM_CHANNEL_2);
 
-    /* Run auto-calibration (~3 seconds) */
-    auto_calibrate();
+    uart_print("\r\n");
+    uart_print("================================================\r\n");
+    uart_print("  CCID v13.7 — Continuous Early + Signed DC\r\n");
+    uart_print("  ALL values in NANOSECONDS\r\n");
+    uart_print("================================================\r\n");
+    uart_print("Commands:\r\n");
+    uart_print("  0x001 - Measure Offset (avg + rms)\r\n");
+    uart_print("  0x002 - PA12 HIGH + Gain + Cg\r\n");
+    uart_print("  0x003 - Start Live Capture\r\n");
+    uart_print("  0x004 - Stop Live Capture\r\n");
+    uart_print("================================================\r\n");
+    uart_print("  Window: 80ms | Early: continuous from 20ms\r\n");
+    uart_print("  DC: I = (avg - offset_avg) / sens  [signed]\r\n");
+    uart_print("  AC: I = sqrt(rms^2 - off^2) / sens [trimmed]\r\n");
+    uart_print("================================================\r\n");
+    uart_print("  PB1: HIGH if |DC| >= 6mA\r\n");
+    uart_print("  PB1: BLINK if AC >= 30mA\r\n");
+    uart_print("  PB1 response: 20-40ms typical\r\n");
+    uart_print("================================================\r\n\r\n");
 
-    /* Enter live capture */
-    sys_state = STATE_LIVE_CAPTURE;
-    start_capture_window();
-
-    /* ================================================================
-     *  Main loop
-     *  Priority 1: close window → process → open next window
-     *  Priority 2: poll Modbus RX + process frame
-     *  Priority 3: signal-loss watchdog
-     * ================================================================ */
     while (1)
     {
-        /* --- Window complete: run precision engine --- */
+        if (USART2->ISR & USART_ISR_RXNE)
+        {
+            uint8_t ch = (uint8_t)(USART2->RDR & 0xFF);
+
+            while (!(USART2->ISR & USART_ISR_TXE)) {}
+            USART2->TDR = ch;
+
+            if (ch == '\r' || ch == '\n')
+            {
+                while (!(USART2->ISR & USART_ISR_TXE)) {}
+                USART2->TDR = '\r';
+                while (!(USART2->ISR & USART_ISR_TXE)) {}
+                USART2->TDR = '\n';
+
+                if (cmd_idx > 0)
+                {
+                    cmd_buf[cmd_idx] = '\0';
+                    process_command(cmd_buf);
+                    cmd_idx = 0;
+                }
+            }
+            else
+            {
+                if (cmd_idx < sizeof(cmd_buf) - 1)
+                    cmd_buf[cmd_idx++] = ch;
+                else
+                    cmd_idx = 0;
+            }
+        }
+
+        if (data_ready)
+        {
+            data_ready = 0;
+
+            if (result_type == 0)
+            {
+                print_offset_result();
+                sys_state = STATE_IDLE;
+            }
+            else if (result_type == 1)
+            {
+                print_mg_result();
+                print_calibration_summary();
+                sys_state = STATE_IDLE;
+            }
+        }
+
         if (sys_state == STATE_LIVE_CAPTURE && live_window_done)
         {
             live_window_done = 0;
             process_capture_window();
             start_capture_window();
-        }
-
-        /* --- Modbus service --- */
-        modbus_poll_rx();
-        modbus_process_frame();
-
-        /* --- Signal-loss watchdog ---
-         * If no samples arrive for 2 seconds while alarms are active,
-         * clear alarms to break the feedback deadlock
-         * (alarm pin → electrical noise → signal lost → alarm never clears).
-         */
-        if ((alarm_dc_active || alarm_ac_active) &&
-            last_sample_tick != 0 &&
-            (HAL_GetTick() - last_sample_tick) > SIGNAL_LOSS_MS)
-        {
-            alarm_dc_active = 0;
-            alarm_ac_active = 0;
-            sync_alarm_pins();
         }
     }
 }
@@ -917,78 +841,89 @@ int main(void)
 /* ============================================================
  *  Clock & Peripheral Init
  * ============================================================ */
+
 void SystemClock_Config(void)
 {
-    RCC_OscInitTypeDef       RCC_OscInitStruct  = {0};
-    RCC_ClkInitTypeDef       RCC_ClkInitStruct  = {0};
-    RCC_PeriphCLKInitTypeDef PeriphClkInit      = {0};
+    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+    RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
 
-    RCC_OscInitStruct.OscillatorType      = RCC_OSCILLATORTYPE_HSI;
-    RCC_OscInitStruct.HSIState            = RCC_HSI_ON;
+    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+    RCC_OscInitStruct.HSIState = RCC_HSI_ON;
     RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-    RCC_OscInitStruct.PLL.PLLState        = RCC_PLL_ON;
-    RCC_OscInitStruct.PLL.PLLSource       = RCC_PLLSOURCE_HSI;
-    RCC_OscInitStruct.PLL.PLLMUL          = RCC_PLL_MUL16;
-    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) Error_Handler();
+    RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+    RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+    RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL16;
+    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+        Error_Handler();
 
-    RCC_ClkInitStruct.ClockType      = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
-                                     | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
-    RCC_ClkInitStruct.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
-    RCC_ClkInitStruct.AHBCLKDivider  = RCC_SYSCLK_DIV1;
+    RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
+                                | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+    RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+    RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
     RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
     RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
-    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK) Error_Handler();
+    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+        Error_Handler();
 
-    PeriphClkInit.PeriphClockSelection  = RCC_PERIPHCLK_TIM1;
-    PeriphClkInit.Tim1ClockSelection    = RCC_TIM1CLK_HCLK;
-    if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK) Error_Handler();
+    PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_TIM1;
+    PeriphClkInit.Tim1ClockSelection = RCC_TIM1CLK_HCLK;
+    if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
+        Error_Handler();
 }
 
 static void MX_TIM1_Init(void)
 {
-    TIM_ClockConfigTypeDef  sClockSourceConfig = {0};
-    TIM_MasterConfigTypeDef sMasterConfig      = {0};
-    TIM_IC_InitTypeDef      sConfigIC          = {0};
+    TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+    TIM_MasterConfigTypeDef sMasterConfig = {0};
+    TIM_IC_InitTypeDef sConfigIC = {0};
 
-    htim1.Instance               = TIM1;
-    htim1.Init.Prescaler         = 0;
-    htim1.Init.CounterMode       = TIM_COUNTERMODE_UP;
-    htim1.Init.Period            = 65535;
-    htim1.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
+    htim1.Instance = TIM1;
+    htim1.Init.Prescaler = 0;
+    htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+    htim1.Init.Period = 65535;
+    htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
     htim1.Init.RepetitionCounter = 0;
     htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-    if (HAL_TIM_Base_Init(&htim1) != HAL_OK) Error_Handler();
+    if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
+        Error_Handler();
 
     sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-    if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK) Error_Handler();
-    if (HAL_TIM_IC_Init(&htim1) != HAL_OK) Error_Handler();
+    if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK)
+        Error_Handler();
+    if (HAL_TIM_IC_Init(&htim1) != HAL_OK)
+        Error_Handler();
 
-    sMasterConfig.MasterOutputTrigger  = TIM_TRGO_RESET;
+    sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
     sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
-    sMasterConfig.MasterSlaveMode      = TIM_MASTERSLAVEMODE_DISABLE;
-    if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK) Error_Handler();
+    sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+    if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+        Error_Handler();
 
-    sConfigIC.ICPolarity  = TIM_INPUTCHANNELPOLARITY_FALLING;
+    sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_FALLING;
     sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
     sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
-    sConfigIC.ICFilter    = 0;
-    if (HAL_TIM_IC_ConfigChannel(&htim1, &sConfigIC, TIM_CHANNEL_1) != HAL_OK) Error_Handler();
-    if (HAL_TIM_IC_ConfigChannel(&htim1, &sConfigIC, TIM_CHANNEL_2) != HAL_OK) Error_Handler();
+    sConfigIC.ICFilter = 0;
+    if (HAL_TIM_IC_ConfigChannel(&htim1, &sConfigIC, TIM_CHANNEL_1) != HAL_OK)
+        Error_Handler();
+    if (HAL_TIM_IC_ConfigChannel(&htim1, &sConfigIC, TIM_CHANNEL_2) != HAL_OK)
+        Error_Handler();
 }
 
 static void MX_USART2_UART_Init(void)
 {
-    huart2.Instance            = USART2;
-    huart2.Init.BaudRate       = 9600;       /* Modbus spec: 9600 baud */
-    huart2.Init.WordLength     = UART_WORDLENGTH_8B;
-    huart2.Init.StopBits       = UART_STOPBITS_1;
-    huart2.Init.Parity         = UART_PARITY_NONE;
-    huart2.Init.Mode           = UART_MODE_TX_RX;
-    huart2.Init.HwFlowCtl      = UART_HWCONTROL_NONE;
-    huart2.Init.OverSampling   = UART_OVERSAMPLING_16;
+    huart2.Instance = USART2;
+    huart2.Init.BaudRate = 115200;
+    huart2.Init.WordLength = UART_WORDLENGTH_8B;
+    huart2.Init.StopBits = UART_STOPBITS_1;
+    huart2.Init.Parity = UART_PARITY_NONE;
+    huart2.Init.Mode = UART_MODE_TX_RX;
+    huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+    huart2.Init.OverSampling = UART_OVERSAMPLING_16;
     huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
     huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-    if (HAL_UART_Init(&huart2) != HAL_OK) Error_Handler();
+    if (HAL_UART_Init(&huart2) != HAL_OK)
+        Error_Handler();
 }
 
 static void MX_GPIO_Init(void)
@@ -998,21 +933,18 @@ static void MX_GPIO_Init(void)
     __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
 
-    /* PA12 = CAL (calibration pulse) */
     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_RESET);
-    GPIO_InitStruct.Pin   = GPIO_PIN_12;
-    GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
-    GPIO_InitStruct.Pull  = GPIO_NOPULL;
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET);
+
+    GPIO_InitStruct.Pin = GPIO_PIN_12;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-    /* PB4 = DC alarm output                   */
-    /* PB3 = AC alarm output                   */
-    /* PB1 = AC+DC combined alarm output       */
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1 | GPIO_PIN_3 | GPIO_PIN_4, GPIO_PIN_RESET);
-    GPIO_InitStruct.Pin   = GPIO_PIN_1 | GPIO_PIN_3 | GPIO_PIN_4;
-    GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
-    GPIO_InitStruct.Pull  = GPIO_NOPULL;
+    GPIO_InitStruct.Pin = GPIO_PIN_1;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 }
@@ -1024,5 +956,8 @@ void Error_Handler(void)
 }
 
 #ifdef USE_FULL_ASSERT
-void assert_failed(uint8_t *file, uint32_t line) { (void)file; (void)line; }
+void assert_failed(uint8_t *file, uint32_t line)
+{
+    (void)file; (void)line;
+}
 #endif
