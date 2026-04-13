@@ -3,39 +3,10 @@
   ******************************************************************************
   * @file           : main.c
   * @brief          : CCID v15.1 — Modbus RTU + Fixed AC/DC Classifier + Dual-Stage Alert
-  * @version        : 16.2
+  * @version        : 16.1
   ******************************************************************************
-  *PB2 = !PB1
-  * CHANGES from v13.1.7:
   *
-  * [1] MODBUS RTU over USART2 at 9600 baud (replacing TeraTerm debug UART)
-  *     Register map (per MD0630T01A spec):
-  *       0x0000  DC Current    R    0.01 mA/LSB
-  *       0x0001  AC Current    R    0.01 mA/LSB
-  *       0x0002  DC Threshold  R/W  0.1 mA/LSB  (default 60 = 6.0 mA)
-  *       0x0003  AC Threshold  R/W  0.1 mA/LSB  (default 300 = 30.0 mA)
-  *       0x0100  Slave Address R/W  (default 1)
-  *     Function codes supported: 0x03 (Read), 0x10 (Write Multiple)
-  *     Frame timeout: 5 ms inter-frame silence (T3.5 at 9600 baud)
-  *     CRC: Modbus CRC-16
-  *
-  * [2] AC/DC CLASSIFIER FIX (resolves 2-6 mA DC misclassification as AC)
-  *     Old bug: variation = (max-min)/|avg| > 0.50 wrongly reclassified
-  *              small DC signals as AC because noise spread is fixed (~78 ns)
-  *              while avg shrinks at low currents.
-  *     Fix:     Inside has_positive&&has_negative branch, check avg deviation
-  *              from offset_avg. If |avg - offset_avg| > offset_rms_ns,
-  *              the mean shift is real → classify as DC.
-  *              True AC has avg ≈ offset_avg (AC averages to zero).
-  *
-  * [3] AUTO-CALIBRATION on boot (1 sec settle + offset + gain = ~3 sec total)
-  *     No manual commands needed. Modbus polling can start immediately after.
-  *
-  * [4] ALARM PINS
-  *     PB4      = DC alarm  — HIGH when |DC| >= dc_alert_mA
-  *     PB3      = AC alarm  — HIGH when AC  >= ac_alert_mA
-  *     PB1      = AC+DC alarm — HIGH when either DC or AC alarm active
-  *     PA12     = CAL pulse — used only during gain calibration
+ Replication of PB1 and linked with PB2 for the same pin
   *
   ******************************************************************************
   */
@@ -512,7 +483,7 @@ static void sync_alarm_pins(void)
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1,
                       (alarm_dc_active || alarm_ac_active) ? GPIO_PIN_SET : GPIO_PIN_RESET);  /* AC+DC combined */
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2,
-                      (alarm_dc_active || alarm_ac_active) ? GPIO_PIN_RESET : GPIO_PIN_SET);  /* PB2 opposite of PB1 */
+                      (alarm_dc_active || alarm_ac_active) ? GPIO_PIN_SET : GPIO_PIN_RESET);  /* PB2 mirror of PB1 */
 }
 
 /* ============================================================
@@ -1011,7 +982,7 @@ static void MX_GPIO_Init(void)
     /* PB4 = DC alarm output                   */
     /* PB3 = AC alarm output                   */
     /* PB1 = AC+DC combined alarm output       */
-    /* PB2 = PB1 opposite output               */
+    /* PB2 = PB1 mirror output                 */
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3 | GPIO_PIN_4, GPIO_PIN_RESET);
     GPIO_InitStruct.Pin   = GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3 | GPIO_PIN_4;
     GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
