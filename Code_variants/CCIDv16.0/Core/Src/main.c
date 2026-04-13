@@ -6,7 +6,7 @@
   * @version        : 16.2
   ******************************************************************************
   *PB2 = !PB1
-  * CHANGES from v13.1.7:
+  * 
   *
   * [1] MODBUS RTU over USART2 at 9600 baud (replacing TeraTerm debug UART)
   *     Register map (per MD0630T01A spec):
