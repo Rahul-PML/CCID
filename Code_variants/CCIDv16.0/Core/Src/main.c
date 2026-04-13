@@ -2,10 +2,11 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body 16.1 [06-04-2026]
-  * @version        : 16.1
+  * @brief          : CCID v15.1 — Modbus RTU + Fixed AC/DC Classifier + Dual-Stage Alert
+  * @version        : 16.0
   ******************************************************************************
-  * DESCRIPTION: logic forward to PB2 alarm pin. 
+  *PB2 = !PB1
+  * CHANGES from v13.1.7:
   *
   * [1] MODBUS RTU over USART2 at 9600 baud (replacing TeraTerm debug UART)
   *     Register map (per MD0630T01A spec):
@@ -511,7 +512,7 @@ static void sync_alarm_pins(void)
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1,
                       (alarm_dc_active || alarm_ac_active) ? GPIO_PIN_SET : GPIO_PIN_RESET);  /* AC+DC combined */
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2,
-                      (alarm_dc_active || alarm_ac_active) ? GPIO_PIN_SET : GPIO_PIN_RESET);  /* PB2 mirror of PB1 */
+                      (alarm_dc_active || alarm_ac_active) ? GPIO_PIN_RESET : GPIO_PIN_SET);  /* PB2 opposite of PB1 */
 }
 
 /* ============================================================
@@ -1010,7 +1011,7 @@ static void MX_GPIO_Init(void)
     /* PB4 = DC alarm output                   */
     /* PB3 = AC alarm output                   */
     /* PB1 = AC+DC combined alarm output       */
-    /* PB2 = PB1 mirror output                 */
+    /* PB2 = PB1 opposite output               */
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3 | GPIO_PIN_4, GPIO_PIN_RESET);
     GPIO_InitStruct.Pin   = GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3 | GPIO_PIN_4;
     GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
